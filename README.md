@@ -106,3 +106,8 @@ yay -Y --makepkg makepkg --save
 sudo rm /usr/local/bin/aur-audit /usr/local/bin/aur-audit-makepkg /etc/pacman.d/hooks/01-aur-audit.hook
 sudo rm -r /etc/aur-audit
 ```
+
+## License
+
+[MIT](LICENSE): anyone can use, copy, modify, and share this freely. It comes
+with no warranty; see the license for details.
