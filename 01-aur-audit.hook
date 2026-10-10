@@ -1,0 +1,14 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = *
+
+[Action]
+Description = Auditing AUR packages for hazards...
+When = PreTransaction
+Exec = /usr/local/bin/aur-audit --hook
+Depends = python
+Depends = libarchive
+NeedsTargets
+AbortOnFail

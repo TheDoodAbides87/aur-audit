@@ -1,0 +1,577 @@
+#!/usr/bin/python3 -I
+"""
+aur-audit: security audit for AUR packages, run as a pacman PreTransaction hook.
+
+Modes:
+  aur-audit --hook             Called by pacman. Reads target names on stdin.
+  aur-audit dir BUILDDIR       Audit a PKGBUILD directory before makepkg touches it
+                               (used by the aur-audit-makepkg wrapper for yay).
+  aur-audit check PKG...       Audit AUR packages by name BEFORE building them.
+  aur-audit file PKGFILE...    Audit already-built package files.
+
+Exit status 1 means at least one BLOCK finding was not allowlisted. In hook
+mode, pacman's AbortOnFail turns that into a cancelled transaction.
+"""
+
+import hashlib
+import ipaddress
+import json
+import os
+import pwd
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+AUR = "https://aur.archlinux.org"
+ALLOWLIST = "/etc/aur-audit/allowlist"
+TIMEOUT = 15
+DAY = 86400
+
+BLOCK, WARN, INFO = "BLOCK", "WARN", "INFO"
+
+
+# ---------------------------------------------------------------- helpers
+
+def http_get(url, accept=None):
+    headers = {"User-Agent": "aur-audit/1.0"}
+    if accept:
+        headers["Accept"] = accept
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        return resp.read().decode("utf-8", "replace")
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True).stdout
+
+
+def load_allowlist():
+    """Lines of 'pkgname version'. Only that exact version is allowed."""
+    allowed = set()
+    try:
+        with open(ALLOWLIST) as f:
+            for line in f:
+                parts = line.split("#", 1)[0].split()
+                if len(parts) == 2:
+                    allowed.add((parts[0], parts[1]))
+    except FileNotFoundError:
+        pass
+    return allowed
+
+
+LOG = []
+
+
+def say(text=""):
+    """Print a report line and keep a plain-text copy for the block report."""
+    print(text)
+    LOG.append(re.sub(r"\033\[[0-9;]*m", "", text))
+
+
+def real_user():
+    """The human behind this run. The pacman hook runs as root via sudo."""
+    for var in ("SUDO_UID", "PKEXEC_UID"):
+        if os.environ.get(var, "").isdigit():
+            try:
+                return pwd.getpwuid(int(os.environ[var]))
+            except KeyError:
+                pass
+    return pwd.getpwuid(os.getuid())
+
+
+def blocked(context):
+    """Save everything reported so far to ~/aur-audit-blocked-<time>.txt, return 1."""
+    user = real_user()
+    path = os.path.join(user.pw_dir, time.strftime("aur-audit-blocked-%Y-%m-%d_%H-%M-%S.txt"))
+    header = [f"aur-audit blocked an AUR package on {time.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+              f"Stage: {context}", "",
+              "BLOCK = reason it was stopped, WARN = worth knowing, INFO = background facts.",
+              f"To allow a package you have reviewed, add its 'name version' line to {ALLOWLIST}.",
+              ""]
+    try:
+        with open(path, "w") as f:
+            f.write("\n".join(header + LOG) + "\n")
+        os.chown(path, user.pw_uid, user.pw_gid)
+        print(f"==> aur-audit: full report saved to {path}")
+    except OSError as e:
+        print(f"==> aur-audit: could not save report to {path}: {e}")
+    return 1
+
+
+class Report:
+    def __init__(self, name):
+        self.name = name
+        self.version = None
+        self.findings = []
+
+    def add(self, level, msg):
+        self.findings.append((level, msg))
+
+    def blocked(self):
+        return any(level == BLOCK for level, _ in self.findings)
+
+
+# ---------------------------------------------------------------- AUR reputation
+
+SUSPICIOUS_SUFFIXES = ("fix", "fixed", "patch", "patched", "update", "updated",
+                       "official", "secure", "new", "latest", "stable")
+
+
+def check_aur_info(rep, info, repo_names):
+    now = time.time()
+    age_days = (now - info["FirstSubmitted"]) / DAY
+    votes = info["NumVotes"]
+    pop = info["Popularity"]
+
+    rep.add(INFO, f"AUR: maintainer={info['Maintainer'] or 'none'}, votes={votes}, "
+                  f"popularity={pop:.3f}, first submitted {age_days:.0f} days ago")
+
+    if age_days < 14 and votes < 10:
+        rep.add(BLOCK, f"brand new AUR package ({age_days:.0f} days old, {votes} votes); "
+                       "most AUR malware has looked exactly like this")
+    elif age_days < 90 and votes < 5:
+        rep.add(WARN, f"young package with little community vetting "
+                      f"({age_days:.0f} days, {votes} votes)")
+
+    if info["Maintainer"] is None:
+        rep.add(WARN, "package is orphaned (no maintainer); anyone can adopt it and push changes")
+    if votes < 3 and pop < 0.01:
+        rep.add(WARN, "almost nobody uses this package")
+    if info["OutOfDate"]:
+        rep.add(INFO, "flagged out-of-date on the AUR")
+
+    # Typosquatting: e.g. "firefox-patch-bin" posing as a fix for the real "firefox".
+    stem = re.sub(r"-(bin|git)$", "", info["Name"])
+    for suf in SUSPICIOUS_SUFFIXES:
+        if stem.endswith("-" + suf) and stem[: -len(suf) - 1] in repo_names:
+            rep.add(WARN if votes >= 10 else BLOCK,
+                    f"name looks like a variant of official package "
+                    f"'{stem[: -len(suf) - 1]}' (classic AUR malware naming)")
+            break
+
+
+# ---------------------------------------------------------------- sources
+
+BAD_HOSTS = {
+    "pastebin.com", "paste.ee", "hastebin.com", "ghostbin.com", "transfer.sh",
+    "bit.ly", "tinyurl.com", "is.gd", "t.co", "goo.gl", "rb.gy", "cutt.ly",
+    "cdn.discordapp.com", "media.discordapp.net", "discord.com",
+    "anonfiles.com", "file.io", "mega.nz", "mediafire.com", "gofile.io",
+    "temp.sh", "0x0.st", "catbox.moe", "files.catbox.moe", "termbin.com",
+}
+BAD_HOST_SUFFIXES = (".ngrok.io", ".ngrok-free.app", ".trycloudflare.com", ".duckdns.org")
+VCS_PREFIXES = ("git+", "git://", "svn+", "hg+", "bzr+", "fossil+")
+VCS_SUFFIXES = ("-git", "-svn", "-hg", "-bzr", "-fossil")
+
+
+def parse_srcinfo(text):
+    sources, sums = [], []
+    for line in text.splitlines():
+        line = line.strip()
+        m = re.match(r"(source(?:_\w+)?)\s*=\s*(.+)", line)
+        if m:
+            sources.append(m.group(2))
+        m = re.match(r"(?:sha\d+|b2|md5|ck)sums(?:_\w+)?\s*=\s*(.+)", line)
+        if m:
+            sums.append(m.group(1))
+    return sources, sums
+
+
+def check_sources(rep, sources, sums):
+    github_repos = set()
+    for i, src in enumerate(sources):
+        url = src.split("::", 1)[-1]
+        if "://" not in url:
+            continue  # local file shipped with the PKGBUILD
+        is_vcs = url.startswith(VCS_PREFIXES)
+        bare = re.sub(r"^\w+\+", "", url)
+        parsed = urllib.parse.urlparse(bare)
+        host = (parsed.hostname or "").lower()
+
+        try:
+            ipaddress.ip_address(host)
+            rep.add(BLOCK, f"source downloads from a raw IP address: {url}")
+            continue
+        except ValueError:
+            pass
+
+        if host in BAD_HOSTS or host.endswith(BAD_HOST_SUFFIXES):
+            rep.add(BLOCK, f"source uses a paste/file-sharing/shortener host: {url}")
+        elif host == "gist.githubusercontent.com" or host == "gist.github.com":
+            rep.add(WARN, f"source comes from a GitHub gist: {url}")
+
+        if parsed.scheme in ("http", "ftp") and not is_vcs:
+            rep.add(WARN, f"source fetched over unencrypted {parsed.scheme}: {url}")
+
+        is_signature = parsed.path.endswith((".asc", ".sig", ".sign"))
+        if not is_vcs and not is_signature and i < len(sums) and sums[i] == "SKIP":
+            rep.add(WARN, f"checksum is SKIP for a non-VCS download: {url}")
+
+        if host in ("github.com", "raw.githubusercontent.com", "objects.githubusercontent.com"):
+            parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) >= 2:
+                github_repos.add((parts[0], parts[1].removesuffix(".git")))
+
+    for owner, repo in sorted(github_repos):
+        check_github_repo(rep, owner, repo)
+
+
+def check_github_repo(rep, owner, repo):
+    try:
+        data = json.loads(http_get(f"https://api.github.com/repos/{owner}/{repo}",
+                                   accept="application/vnd.github+json"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            rep.add(WARN, f"GitHub repo {owner}/{repo} does not exist or is private")
+        else:
+            rep.add(INFO, f"could not check GitHub repo {owner}/{repo} (HTTP {e.code}, "
+                          "probably API rate limit)")
+        return
+    except OSError as e:
+        rep.add(INFO, f"could not check GitHub repo {owner}/{repo}: {e}")
+        return
+
+    created = time.mktime(time.strptime(data["created_at"], "%Y-%m-%dT%H:%M:%SZ"))
+    age_days = (time.time() - created) / DAY
+    stars = data["stargazers_count"]
+    rep.add(INFO, f"GitHub {owner}/{repo}: {stars} stars, created {age_days:.0f} days ago")
+    if age_days < 30 and stars < 10:
+        rep.add(BLOCK, f"upstream GitHub repo {owner}/{repo} is brand new with almost no "
+                       f"stars ({age_days:.0f} days, {stars} stars)")
+    elif stars < 5:
+        rep.add(WARN, f"upstream GitHub repo {owner}/{repo} has very few stars ({stars})")
+    if data.get("archived"):
+        rep.add(INFO, f"upstream GitHub repo {owner}/{repo} is archived")
+
+
+# ---------------------------------------------------------------- script content
+
+# (level, regex, description). Applied to PKGBUILDs and .INSTALL scripts.
+SCRIPT_RULES = [
+    (BLOCK, r"\b(curl|wget|fetch)\b[^\n|;]*\|\s*(sudo\s+)?(ba|z|da|k|fi)?sh\b",
+     "pipes a download straight into a shell"),
+    (BLOCK, r"\b(ba|z)?sh\s+-c\s+[\"']?\$\((curl|wget)",
+     "executes downloaded code"),
+    (BLOCK, r"eval\s+[\"']?\$\((curl|wget|echo[^)]*base64)",
+     "evals downloaded or encoded code"),
+    (BLOCK, r"base64\s+(-d|--decode)[^\n]*\|\s*(ba|z)?sh\b",
+     "decodes base64 and runs it as a shell script"),
+    (BLOCK, r"python[23]?\s+-c\s+[\"'].*\b(exec|eval|b64decode|urlopen|socket)\b",
+     "runs inline Python that execs/decodes/downloads code"),
+    (BLOCK, r"/dev/(tcp|udp)/", "opens a raw network socket (reverse-shell technique)"),
+    (BLOCK, r"\b(nc|ncat|netcat)\b[^\n]*\s-[ec]\b", "netcat with command execution"),
+    (BLOCK, r"/etc/ld\.so\.preload", "touches /etc/ld.so.preload (rootkit technique)"),
+    (BLOCK, r"/etc/sudoers", "modifies sudo configuration"),
+    (BLOCK, r"\bcrontab\b|/etc/cron|/var/spool/cron", "installs a cron job"),
+    (BLOCK, r"authorized_keys", "touches SSH authorized_keys"),
+    (BLOCK, r"\b(chpasswd|passwd\s+\w)", "changes account passwords"),
+    (BLOCK, r"\brm\s+-[a-zA-Z]*r[a-zA-Z]*\s+(/|~|\$HOME|/home)(\s|$|/\*)",
+     "recursively deletes / or a home directory"),
+    (BLOCK, r"(\.bashrc|\.zshrc|\.profile|\.bash_profile|\.config/autostart)",
+     "modifies a user's shell startup or autostart files"),
+    (WARN, r"\bchmod\s+([ugoa]*\+[rwx]*s|[0-7]?[4-7][0-7]{3}\b)", "sets setuid/setgid bits"),
+    (WARN, r"\bsystemctl\s+(--now\s+)?(enable|start)\b", "enables or starts a systemd service"),
+    (WARN, r"\b(setenforce\s+0|iptables\s+-F|ufw\s+disable|aa-teardown)",
+     "disables a security control"),
+    (WARN, r"\b(?![0-9a-fA-F]{120,}\b)[A-Za-z0-9+/]{120,}={0,2}", "contains a long base64-like blob (possible obfuscation)"),
+    (WARN, r"\\x[0-9a-fA-F]{2}(\\x[0-9a-fA-F]{2}){15,}", "contains hex-escaped data (possible obfuscation)"),
+]
+
+# Extra rules only for .INSTALL: these scripts run as ROOT during the install.
+INSTALL_RULES = [
+    (BLOCK, r"\b(curl|wget|aria2c|fetch)\b", "downloads files while running as root"),
+    (BLOCK, r"\b(useradd|usermod)\b[^\n]*-[a-zA-Z]*G[^\n]*\b(wheel|sudo|root)\b",
+     "adds a user to an admin group"),
+]
+
+# Network access inside build()/package() rather than via the source array.
+PKGBUILD_RULES = [
+    (WARN, r"^\s*[^#\n]*\b(curl|wget)\b(?![^\n]*(--version|-V\b))",
+     "downloads files outside the source=() array (not checksum-verified)"),
+]
+
+
+def strip_echo_lines(text):
+    """Ignore lines that only print text, e.g. post-install instructions.
+    Lines that pipe, redirect, or substitute commands are still scanned."""
+    def only_prints(line):
+        if re.match(r"\s*#", line):
+            return True
+        return (re.match(r"\s*(echo|printf|msg2?|warning|plain)\b", line)
+                and not re.search(r"[|>`]|\$\(", line))
+    return "\n".join(l for l in text.splitlines() if not only_prints(l))
+
+
+def scan_script(rep, label, text, extra_rules=()):
+    text = strip_echo_lines(text)
+    for level, pattern, desc in list(SCRIPT_RULES) + list(extra_rules):
+        m = re.search(pattern, text, re.MULTILINE)
+        if m:
+            line = text[: m.start()].count("\n") + 1
+            snippet = text.splitlines()[line - 1].strip()[:100]
+            rep.add(level, f"{label} {desc}  [line {line}: {snippet}]")
+
+
+# ---------------------------------------------------------------- built package contents
+
+PATH_RULES = [
+    (BLOCK, r"^etc/ld\.so\.preload$", "installs /etc/ld.so.preload (rootkit technique)"),
+    (BLOCK, r"^etc/sudoers(\.d/|$)", "installs sudo rules"),
+    (BLOCK, r"^(home|root)/", "installs files into a home directory"),
+    (BLOCK, r"^(etc/cron|var/spool/cron)", "installs cron jobs"),
+    (WARN, r"^tmp/", "installs files into /tmp"),
+    (WARN, r"^etc/profile\.d/", "runs code in every login shell (/etc/profile.d)"),
+    (WARN, r"^etc/pam\.d/", "changes PAM authentication config"),
+    (WARN, r"^etc/ssh/", "changes SSH config"),
+    (WARN, r"^etc/xdg/autostart/", "autostarts a program for every desktop user"),
+    (WARN, r"^(etc|usr/lib)/systemd/(system|user)/[^/]+\.wants/", "auto-enables a systemd unit"),
+]
+
+
+def pkginfo_field(text, key):
+    m = re.search(rf"^{key} = (.+)$", text, re.MULTILINE)
+    return m.group(1) if m else None
+
+
+def audit_package_file(rep, path):
+    pkginfo = run(["bsdtar", "-xOf", path, ".PKGINFO"])
+    rep.version = rep.version or pkginfo_field(pkginfo, "pkgver")
+
+    install = run(["bsdtar", "-xOf", path, ".INSTALL"])
+    if install.strip():
+        scan_script(rep, ".INSTALL (runs as root):", install, INSTALL_RULES)
+
+    for line in run(["bsdtar", "-tvf", path]).splitlines():
+        fields = line.split(None, 8)
+        if len(fields) < 9:
+            continue
+        mode, fname = fields[0], fields[8].split(" -> ")[0]
+        if fname.startswith("."):
+            continue
+        for level, pattern, desc in PATH_RULES:
+            if re.search(pattern, fname):
+                rep.add(level, f"package {desc}: /{fname}")
+        if mode[0] == "-" and (mode[3] in "sS" or mode[6] in "sS"):
+            rep.add(WARN, f"setuid/setgid file (runs with elevated privileges): /{fname}")
+
+
+# ---------------------------------------------------------------- orchestration
+
+def repo_package_names():
+    return set(run(["pacman", "-Slq"]).split())
+
+
+def aur_info(names):
+    if not names:
+        return {}
+    query = "&".join("arg[]=" + urllib.parse.quote(n) for n in names)
+    data = json.loads(http_get(f"{AUR}/rpc/v5/info?{query}"))
+    return {r["Name"]: r for r in data.get("results", [])}
+
+
+def audit(name, pkgfile, info, repo_names):
+    rep = Report(name)
+    if pkgfile:
+        rep.version = pkginfo_field(run(["bsdtar", "-xOf", pkgfile, ".PKGINFO"]), "pkgver")
+
+    if info is None:
+        rep.add(WARN, "not found on the AUR (local/custom package, or deleted from the AUR, "
+                      "which often happens when a package is removed for being malicious)")
+    else:
+        check_aur_info(rep, info, repo_names)
+        base = urllib.parse.quote(info["PackageBase"])
+        try:
+            srcinfo = http_get(f"{AUR}/cgit/aur.git/plain/.SRCINFO?h={base}")
+            check_sources(rep, *parse_srcinfo(srcinfo))
+            pkgbuild = http_get(f"{AUR}/cgit/aur.git/plain/PKGBUILD?h={base}")
+            scan_script(rep, "PKGBUILD", pkgbuild, PKGBUILD_RULES)
+        except OSError as e:
+            rep.add(BLOCK, f"could not download PKGBUILD/.SRCINFO to audit it: {e}")
+        if rep.version and rep.version != info["Version"]:
+            rep.add(WARN, f"built version {rep.version} differs from current AUR version "
+                          f"{info['Version']}")
+
+    if pkgfile:
+        audit_package_file(rep, pkgfile)
+    return rep
+
+
+def srcinfo_fields(text, key):
+    return [m.group(1).strip() for m in re.finditer(rf"^\s*{key}\s*=\s*(.+)$", text, re.MULTILINE)]
+
+
+def audit_build_dir(path):
+    """Audit the files yay is about to build, before makepkg sources the PKGBUILD."""
+    read = lambda name: open(os.path.join(path, name), errors="replace").read()
+    try:
+        srcinfo, pkgbuild = read(".SRCINFO"), read("PKGBUILD")
+    except OSError as e:
+        say(f"==> aur-audit: cannot read PKGBUILD/.SRCINFO in {path} ({e}); refusing to build.")
+        return blocked("before build (yay, via aur-audit-makepkg) in " + os.path.abspath(path))
+
+    installs = {}
+    for name in srcinfo_fields(srcinfo, "install"):
+        try:
+            installs[name] = read(name)
+        except OSError:
+            pass
+
+    # yay calls makepkg several times per package; only audit each version of the files once.
+    digest = hashlib.sha256((srcinfo + pkgbuild + "".join(installs.values())).encode()).hexdigest()
+    marker = os.path.join(path, ".aur-audit-passed")
+    try:
+        if open(marker).read().strip() == digest:
+            return 0
+    except OSError:
+        pass
+
+    base = (srcinfo_fields(srcinfo, "pkgbase") or ["?"])[0]
+    names = srcinfo_fields(srcinfo, "pkgname")
+    epoch = (srcinfo_fields(srcinfo, "epoch") or [None])[0]
+    version = (srcinfo_fields(srcinfo, "pkgver") or ["?"])[0] + "-" + \
+              (srcinfo_fields(srcinfo, "pkgrel") or ["?"])[0]
+    if epoch:
+        version = f"{epoch}:{version}"
+
+    rep = Report(base)
+    rep.version = version
+    try:
+        infos = aur_info(names)
+    except OSError as e:
+        say(f"==> aur-audit: cannot reach the AUR ({e}); refusing to build unverified "
+              "AUR packages.")
+        return blocked("before build (yay, via aur-audit-makepkg) in " + os.path.abspath(path))
+
+    info = next((infos[n] for n in names if n in infos), None)
+    if info is None:
+        rep.add(WARN, "not found on the AUR (local/custom package, or deleted from the AUR, "
+                      "which often happens when a package is removed for being malicious)")
+    else:
+        check_aur_info(rep, info, repo_package_names())
+        if version != info["Version"] and not base.endswith(VCS_SUFFIXES):
+            rep.add(WARN, f"local version {version} differs from current AUR version "
+                          f"{info['Version']}")
+
+    check_sources(rep, *parse_srcinfo(srcinfo))
+    scan_script(rep, "PKGBUILD", pkgbuild, PKGBUILD_RULES)
+    for name, text in installs.items():
+        scan_script(rep, f"{name} (runs as root at install):", text, INSTALL_RULES)
+
+    if print_report(rep, load_allowlist()):
+        say("\n==> aur-audit: hazardous AUR package found. Build cancelled before any "
+              "of its code ran.")
+        return blocked("before build (yay, via aur-audit-makepkg) in " + os.path.abspath(path))
+    with open(marker, "w") as f:
+        f.write(digest + "\n")
+    return 0
+
+
+def pacman_package_files():
+    """pacman -U is given package file paths; read them from our parent's cmdline."""
+    files = {}
+    try:
+        with open(f"/proc/{os.getppid()}/cmdline", "rb") as f:
+            args = f.read().decode("utf-8", "replace").split("\0")
+    except OSError:
+        return files
+    for arg in args:
+        if re.search(r"\.pkg\.tar(\.\w+)?$", arg) and not arg.startswith("/"):
+            arg = os.path.join(f"/proc/{os.getppid()}/cwd", arg)
+        if re.search(r"\.pkg\.tar(\.\w+)?$", arg) and os.path.isfile(arg):
+            name = pkginfo_field(run(["bsdtar", "-xOf", arg, ".PKGINFO"]), "pkgname")
+            if name:
+                files[name] = arg
+    return files
+
+
+def lookup_name(name, infos):
+    """Split debug packages (foo-debug) are audited as their parent."""
+    if name in infos:
+        return infos[name]
+    if name.endswith("-debug"):
+        return infos.get(name[: -len("-debug")])
+    return None
+
+
+def print_report(rep, allowed):
+    color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+    paint = {BLOCK: "\033[1;31m", WARN: "\033[1;33m", INFO: "\033[2m"} if color else {}
+    reset = "\033[0m" if color else ""
+
+    say(f"\n==> aur-audit: {rep.name} {rep.version or ''}")
+    order = {BLOCK: 0, WARN: 1, INFO: 2}
+    for level, msg in sorted(rep.findings, key=lambda f: order[f[0]]):
+        say(f"  {paint.get(level, '')}[{level}]{reset} {msg}")
+
+    if not rep.blocked():
+        say("  -> passed")
+        return False
+    if (rep.name, rep.version) in allowed:
+        say(f"  -> BLOCK findings overridden by {ALLOWLIST}")
+        return False
+    say(f"  {paint.get(BLOCK, '')}-> HAZARDOUS: refusing to install.{reset}")
+    say(f"     If you have reviewed it and trust it, add this line to {ALLOWLIST}:")
+    say(f"       {rep.name} {rep.version or '<version>'}")
+    return True
+
+
+STAGES = {
+    "--hook": "before install (pacman hook); the package was built but nothing was installed",
+    "check": "manual check (aur-audit check)",
+    "file": "manual check of package files (aur-audit file)",
+}
+
+
+def main(argv):
+    if len(argv) == 3 and argv[1] == "dir":
+        return audit_build_dir(argv[2])
+    if len(argv) >= 2 and argv[1] == "--hook":
+        targets = sys.stdin.read().split()
+        repo_names = repo_package_names()
+        foreign = [t for t in targets if t not in repo_names]
+        if not foreign:
+            return 0
+        files = pacman_package_files()
+        pkgfiles = {n: files.get(n) for n in foreign}
+    elif len(argv) >= 3 and argv[1] == "check":
+        repo_names = repo_package_names()
+        pkgfiles = {n: None for n in argv[2:]}
+    elif len(argv) >= 3 and argv[1] == "file":
+        repo_names = repo_package_names()
+        pkgfiles = {}
+        for path in argv[2:]:
+            name = pkginfo_field(run(["bsdtar", "-xOf", path, ".PKGINFO"]), "pkgname")
+            if not name:
+                print(f"aur-audit: {path} is not a pacman package", file=sys.stderr)
+                return 2
+            pkgfiles[name] = path
+    else:
+        print(__doc__.strip())
+        return 2
+
+    query = set(pkgfiles) | {n[: -len("-debug")] for n in pkgfiles if n.endswith("-debug")}
+    try:
+        infos = aur_info(sorted(query))
+    except OSError as e:
+        say(f"==> aur-audit: cannot reach the AUR ({e}); refusing to install unverified "
+              "AUR packages.")
+        return blocked(STAGES[argv[1]])
+
+    allowed = load_allowlist()
+    hazardous = False
+    for name, pkgfile in pkgfiles.items():
+        rep = audit(name, pkgfile, lookup_name(name, infos), repo_names)
+        hazardous |= print_report(rep, allowed)
+
+    if hazardous:
+        say("\n==> aur-audit: hazardous AUR package(s) found. Transaction cancelled.")
+        return blocked(STAGES[argv[1]])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

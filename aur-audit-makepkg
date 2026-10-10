@@ -1,0 +1,5 @@
+#!/bin/sh
+# makepkg replacement for yay (yay -Y --makepkg /usr/local/bin/aur-audit-makepkg --save).
+# Audits the PKGBUILD in the current directory before makepkg runs any of it.
+/usr/local/bin/aur-audit dir . || exit 1
+exec /usr/bin/makepkg "$@"
