@@ -47,7 +47,7 @@ When something is blocked, the full report is saved to
 ## Install
 
 ```sh
-git clone https://github.com/<you>/aur-audit.git
+git clone https://github.com/TheDoodAbides87/aur-audit.git
 cd aur-audit
 sudo ./install.sh
 ```
