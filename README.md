@@ -167,6 +167,23 @@ some-package 1.2.3-1
 
 Only that exact version is allowed, so every update gets audited again.
 
+## Tested so far
+
+Tested by me on Arch Linux (Omarchy) with yay, as of October 2026:
+
+- ✅ yay build-time check: passes established packages and **blocked a real
+  brand-new AUR package** before any of its code ran, with the report saved
+- ✅ pacman hook: audits AUR packages during real installs and passes official
+  and third-party repo packages silently
+- ✅ AI review with **Claude Code**, both for blocked packages and installed ones
+- ⚠️ Not yet tested: AI review with Codex, Gemini CLI, OpenCode, and Ollama
+  (their commands follow each tool's documented flags, but haven't been run);
+  a real block *inside pacman* (tested only in simulation); AUR helpers other
+  than yay
+
+If you try one of the untested paths, an issue saying whether it worked is
+very welcome.
+
 ## Limitations
 
 - **The checks are pattern-based.** They catch common, known malware techniques,
