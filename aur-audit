@@ -643,7 +643,7 @@ Then run this command again.""")
     if len(installed) == 1:
         tool = installed[0]
     else:
-        print("Which AI assistant should review blocked packages?")
+        print("Which AI assistant should review packages?")
         for i, t in enumerate(installed, 1):
             print(f"  {i}) {t}")
         try:
