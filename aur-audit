@@ -420,12 +420,29 @@ def audit_build_dir(path):
         except OSError:
             pass
 
-    # yay calls makepkg several times per package; only audit each version of the files once.
-    digest = hashlib.sha256((srcinfo + pkgbuild + "".join(installs.values())).encode()).hexdigest()
+    # yay calls makepkg several times per package, and keeps going after a failed call.
+    # Remember results so each version of the files is only audited (and reported) once.
+    # The allowlist is part of the fingerprint, so allowlisting a package re-audits it.
+    try:
+        allowlist_text = open(ALLOWLIST).read()
+    except OSError:
+        allowlist_text = ""
+    digest = hashlib.sha256((srcinfo + pkgbuild + "".join(installs.values())
+                             + allowlist_text).encode()).hexdigest()
     marker = os.path.join(path, ".aur-audit-passed")
+    block_marker = os.path.join(path, ".aur-audit-blocked")
     try:
         if open(marker).read().strip() == digest:
             return 0
+    except OSError:
+        pass
+    try:
+        # A block is only remembered for 10 minutes: votes and age change over time.
+        if (open(block_marker).read().strip() == digest
+                and time.time() - os.path.getmtime(block_marker) < 600):
+            print("==> aur-audit: still blocked (see the aur-audit-blocked report in your "
+                  "home folder)")
+            return 1
     except OSError:
         pass
 
@@ -464,6 +481,8 @@ def audit_build_dir(path):
     if print_report(rep, load_allowlist()):
         say("\n==> aur-audit: hazardous AUR package found. Build cancelled before any "
               "of its code ran.")
+        with open(block_marker, "w") as f:
+            f.write(digest + "\n")
         return blocked("before build (yay, via aur-audit-makepkg) in " + os.path.abspath(path))
     with open(marker, "w") as f:
         f.write(digest + "\n")
