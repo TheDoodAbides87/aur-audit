@@ -10,23 +10,36 @@
 
 A security check for [AUR](https://aur.archlinux.org/) packages on Arch Linux.
 It audits AUR packages for signs of malware and **cancels the build or install**
-if it finds anything hazardous.
+if it finds anything hazardous. It can also check your whole system for signs
+of a past infection.
 
-It checks at two points:
+It protects you at three points:
 
 1. **Before yay builds anything.** A small wrapper around `makepkg` audits the
    PKGBUILD that yay downloaded *before* any of its code runs, before sources
-   are downloaded, and before yay asks to import PGP keys.
+   are downloaded, and before yay asks to import PGP keys. For updates, it also
+   compares the new version with the one you have installed.
 2. **Before pacman installs anything.** A pacman hook audits the built package
    (its install script and the files inside it) and aborts the transaction if
    it is hazardous.
+3. **Whenever you ask.** `aur-audit system` checks the packages you already
+   have, every installed file, and the places malware hides to start itself.
 
-Packages from the official repos are skipped.
+Packages from the official repos are skipped by the first two.
 
-**aur-audit does not use AI to scan packages.** The checks are plain,
-rule-based Python, with no AI and no tokens spent. AI was only used to *write*
-this project (see above). If you *want* a second opinion on something that got
-blocked, there's an [optional AI review](#optional-ai-review-of-blocked-packages).
+**aur-audit does not use AI to scan.** All checks are plain, rule-based Python,
+with no AI and no tokens spent. AI was only used to *write* this project (see
+above). If you *want* a second opinion, there are [optional AI reviews](#optional-ai-reviews)
+of a blocked package, an installed package, or your whole system, using the AI
+assistant you already have.
+
+### Built to catch real AUR attacks
+
+| Attack | How aur-audit catches it |
+|---|---|
+| **Oct 2026:** 15+ fake copies of yay (`yyay`, …) whose install scripts downloaded code from a git host and ran it as root | Brand-new package, name one typo away from `yay`, maintainer mass-uploading, install script downloading with `git` |
+| **June 2026:** abandoned packages taken over; the new maintainer added `npm install atomic-lockfile` (infostealer + eBPF rootkit) | A new committer adding a named npm package install compared with your installed version; the system scan looks for `atomic-lockfile` traces |
+| **2025:** new packages like `firefox-patch-bin` shipping a remote-access trojan | Brand-new package, name imitating an official package with a `-patch`/`-fix` suffix, payload from a brand-new GitHub repo with almost no stars |
 
 ## What it checks
 
@@ -49,7 +62,7 @@ When something is blocked, the full report is saved to
 - Arch Linux (or an Arch-based distro) with `pacman`
 - `python` (3.10+), `libarchive` (`bsdtar`)
 - [`yay`](https://github.com/Jguer/yay) for the build-time check (the pacman hook works without it)
-- *Optional:* an AI assistant for `aur-audit ai` (see below). **Not needed** for anything else.
+- *Optional:* an AI assistant for the `aur-audit ai …` reviews (see below). **Not needed** for anything else.
 
 ## Install
 
@@ -88,10 +101,36 @@ aur-audit system                  # check this whole system for signs of malware
 aur-audit ai --system             # the same, plus an AI review (shows token cost first)
 ```
 
-## Optional: AI review of blocked packages
+### Files it saves in your home folder
 
-The rules can't tell a brand-new *legitimate* package from a brand-new
-*malicious* one. When something is blocked, the message offers a second opinion:
+| File | When |
+|---|---|
+| `~/aur-audit-blocked-<date>.txt` | A package was blocked: the full reasons |
+| `~/aur-audit-system-scan-<date>.txt` | You ran `aur-audit system` or `ai --system` |
+| `~/aur-audit-ai-review-<package>-<date>.txt` | An AI reviewed a blocked or installed package |
+| `~/aur-audit-ai-system-data-<date>.txt` | Exactly what `ai --system` would send to the AI |
+| `~/aur-audit-ai-system-review-<date>.txt` | The AI's system review |
+
+They're plain text. Delete them whenever you like.
+
+## Optional: AI reviews
+
+Rules can't tell a brand-new *legitimate* package from a brand-new *malicious*
+one, or a harmless distro tweak from tampering. For a second opinion,
+aur-audit can hand what it found to **the AI assistant you already use**. There
+are three kinds of review, and none of them runs unless you ask:
+
+| Command | Reviews |
+|---|---|
+| `aur-audit ai <package>` | A package that was blocked |
+| `aur-audit ai --installed <package>` | A package you already have installed |
+| `aur-audit ai --system` | Your whole system ([see below](#checking-your-whole-system)) |
+
+The setup and safety notes [further down](#setup-and-safety) apply to all three.
+
+### Reviewing a blocked package
+
+When something is blocked, the message offers a second opinion:
 
 ```sh
 aur-audit ai ~/.cache/yay/some-package      # or just: aur-audit ai some-package
@@ -103,7 +142,9 @@ actually malicious or a false positive. The answer starts with
 `VERDICT: MALICIOUS | SUSPICIOUS | PROBABLY SAFE`, explains why in plain
 language, and is saved to `~/aur-audit-ai-review-<package>-<date>.txt`.
 
-| Supported assistant | Runs as |
+Supported assistants:
+
+| Assistant | Runs as |
 |---|---|
 | [Claude Code](https://claude.com/claude-code) (`claude`) | `claude -p` with all tools disabled |
 | [Codex CLI](https://github.com/openai/codex) (`codex`) | `codex exec` in a read-only sandbox |
@@ -221,7 +262,7 @@ eBPF rootkit; check with `sudo bpftool prog list`), root's cron jobs,
 ## When it blocks something you trust
 
 Review the package yourself (and optionally get an
-[AI second opinion](#optional-ai-review-of-blocked-packages)), then add the `name version` line that the block
+[AI second opinion](#reviewing-a-blocked-package)), then add the `name version` line that the block
 message shows to `/etc/aur-audit/allowlist`:
 
 ```
@@ -263,6 +304,14 @@ very welcome.
   *after* the package has already been built.
 - GitHub reputation checks use the unauthenticated GitHub API (60 requests/hour);
   when rate-limited, that check is skipped with a note.
+- The system scan runs without root, so it can't see eBPF programs, root's cron
+  jobs, `/etc/sudoers.d`, or root-only files. It compares files with pacman's
+  own records, so an attacker who already had root could have altered those
+  records too. A clean scan is good evidence, not proof.
+- The system scan doesn't look at browser extensions, Flatpaks, AppImages,
+  `~/.local/bin`, kernel modules, or firmware.
+- Token estimates for `ai --system` are approximate (about 3.5 characters per
+  token), and each AI tool adds its own built-in instructions on top.
 
 ## Uninstall
 
@@ -271,6 +320,7 @@ yay -Y --makepkg makepkg --save
 sudo rm /usr/local/bin/aur-audit /usr/local/bin/aur-audit-makepkg /etc/pacman.d/hooks/01-aur-audit.hook
 sudo rm -r /etc/aur-audit
 rm -rf ~/.config/aur-audit
+rm -f ~/aur-audit-*.txt          # optional: saved reports
 ```
 
 ## License
