@@ -32,9 +32,10 @@ blocked, there's an [optional AI review](#optional-ai-review-of-blocked-packages
 
 | Area | Blocks if… | Warns if… |
 |---|---|---|
-| **AUR reputation** | Package is under 14 days old with fewer than 10 votes; name imitates an official package with a suffix like `-fix`, `-patch`, `-update` | Orphaned, barely used, young with few votes, or no longer on the AUR |
+| **AUR reputation** | Package is under 14 days old with fewer than 10 votes; name imitates an official package with a suffix like `-fix`, `-patch`, `-update`; name is **one typo away from a popular package** (`yyay` → `yay`, `parru` → `paru`, `goog1e-chrome`) | Orphaned, barely used, young with few votes, no longer on the AUR, or the maintainer uploaded many new packages in the last week |
+| **Updates** | Compared with the version you have installed: a **new committer** adds download commands, npm/pip/cargo package installs, new download sites, or an install script (the June 2026 takeover pattern) | The same additions from the existing maintainer |
 | **Sources** | Downloads from a raw IP address, paste sites, file-sharing sites, URL shorteners, Discord's CDN, ngrok; upstream GitHub repo is brand new with almost no stars | Plain http, `SKIP` checksums on non-signature files, GitHub repo with very few stars |
-| **PKGBUILD / install script** | `curl … \| sh`, running decoded base64, reverse shells, editing sudoers, cron, `ld.so.preload`, `.bashrc`, SSH keys. Install scripts (which run as root) that download anything | setuid bits, enabling services, disabling security controls, obfuscated-looking blobs |
+| **PKGBUILD / install script** | `curl … \| sh`, running decoded base64, reverse shells, editing sudoers, cron, `ld.so.preload`, `.bashrc`, SSH keys. Install scripts (which run as root) that download anything: `curl`/`wget`, `git clone`, `npm`/`pip`/`cargo` installs, or scripting-language downloads | setuid bits, enabling services, disabling security controls, obfuscated-looking blobs, installing a *named* package from npm/PyPI/crates.io/RubyGems/Go during the build |
 | **Package contents** | Files in `/home`, `/root`, sudoers, cron, `ld.so.preload` | setuid binaries, autostart, PAM, or SSH config changes |
 
 If the AUR can't be reached, AUR packages are blocked rather than allowed
@@ -83,6 +84,8 @@ aur-audit dir .                   # audit a PKGBUILD folder (e.g. before running
 aur-audit file foo.pkg.tar.zst    # audit an already-built package file
 aur-audit ai some-package         # optional: ask your AI assistant about a blocked package
 aur-audit ai --installed some-pkg # optional: ask your AI assistant about an installed package
+aur-audit system                  # check this whole system for signs of malware (free, no AI)
+aur-audit ai --system             # the same, plus an AI review (shows token cost first)
 ```
 
 ## Optional: AI review of blocked packages
@@ -155,6 +158,66 @@ blocked does the same thing.
   package files to that provider and use your normal usage/credits. Ollama
   keeps everything local.
 
+## Checking your whole system
+
+```sh
+aur-audit system
+```
+
+A free, rule-based check of the whole system. It uses no AI and doesn't need
+root, and takes under a minute. It looks at:
+
+- **Every package from outside the official repos** (AUR or local): AUR
+  reputation, typo-squatted names, packages that have **disappeared from the
+  AUR** (often a sign they were removed as malware), install scripts, setuid
+  files, and the PKGBUILD you built them from
+- **Every installed file** (`pacman -Qkk`): which files changed since they were
+  installed. Changed programs are highlighted.
+- **Places malware uses to start itself:** systemd services and timers not
+  installed by any package, services pointing into temporary folders,
+  autostart entries, cron jobs, `/etc/ld.so.preload`, and suspicious lines in
+  shell startup files (`.bashrc`, `.zshrc`, `/etc/profile.d`, …)
+- **Hidden programs:** setuid programs not installed by any package, programs
+  in `/tmp`, `/var/tmp` and `/dev/shm`, processes running from those folders,
+  unowned programs in `/usr/bin`, and known traces of past AUR attacks
+  (e.g. the `atomic-lockfile` npm package)
+
+The results are printed and saved to `~/aur-audit-system-scan-<date>.txt`.
+Labels: **SERIOUS** = investigate now, **CHECK** = worth a look, **INFO** = background.
+
+Some findings are normal. For example, Omarchy deliberately changes the first
+line of some Python programs (like `lutris`) so they use the system Python. That
+shows up as "file contents changed".
+
+### With an AI review
+
+```sh
+aur-audit ai --system
+```
+
+Runs the same scan, then shows **how much it will cost before sending anything**:
+
+```
+==> AI system review with claude
+    Data to send:      11 KB (exactly what will be sent: ~/aur-audit-ai-system-data-<date>.txt)
+    Estimated usage:   about 3,700 input tokens + up to 4,000 output tokens
+                       = roughly 7,700 tokens
+    claude also adds its own built-in instructions, so real usage will be somewhat higher.
+Send it? [y/N]
+```
+
+The estimate grows with the number of AUR packages you have installed.
+**Nothing is sent unless you answer `y`**, and you can open the data file first
+to see exactly what would be sent. To keep it private, only file paths, package
+details, startup commands and *flagged* lines are included. Whole personal files
+like your `.bashrc` are never sent, and neither are service `Environment=` lines,
+which can hold passwords. With Ollama, it all stays on your computer. Add
+`--yes` to skip the question (e.g. in scripts).
+
+**Not checked without root:** eBPF programs (the June 2026 malware included an
+eBPF rootkit; check with `sudo bpftool prog list`), root's cron jobs,
+`/etc/sudoers.d`, and files only root can read.
+
 ## When it blocks something you trust
 
 Review the package yourself (and optionally get an
@@ -176,6 +239,10 @@ Tested by me on Arch Linux (Omarchy) with yay, as of October 2026:
 - ✅ pacman hook: audits AUR packages during real installs and passes official
   and third-party repo packages silently
 - ✅ AI review with **Claude Code**, both for blocked packages and installed ones
+- ✅ `aur-audit system` and `aur-audit ai --system` (Claude) on a real Omarchy system
+- ✅ Reconstructions of the **Oct 2026 fake-yay** (`yyay`) package and the **June
+  2026 npm takeover** (`npm install atomic-lockfile` added by a new committer)
+  are both blocked. No false blocks across 60+ real AUR packages and PKGBUILDs.
 - ⚠️ Not yet tested: AI review with Codex, Gemini CLI, OpenCode, and Ollama
   (their commands follow each tool's documented flags, but haven't been run);
   a real block *inside pacman* (tested only in simulation); AUR helpers other
@@ -186,6 +253,8 @@ very welcome.
 
 ## Limitations
 
+- Typo detection covers doubled, missing, swapped and look-alike characters and
+  neighbouring keyboard keys, but not every possible misspelling.
 - **The checks are pattern-based.** They catch common, known malware techniques,
   but a careful attacker could write a PKGBUILD that gets past them. Passing the
   audit does not mean a package is safe.

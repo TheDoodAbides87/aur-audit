@@ -12,6 +12,9 @@ Modes:
                                actually malicious (optional; never unblocks anything).
   aur-audit ai --installed PKG Ask your AI assistant to review a package you
                                already have installed (AUR or official repos).
+  aur-audit system             Check this system for signs of malware (free, no AI).
+  aur-audit ai --system        The same, then (after showing the estimated token
+                               cost and asking) have your AI assistant review it.
 
 Exit status 1 means at least one BLOCK finding was not allowlisted. In hook
 mode, pacman's AbortOnFail turns that into a cancelled transaction.
@@ -152,6 +155,9 @@ def check_aur_info(rep, info, repo_names):
     if info["OutOfDate"]:
         rep.add(INFO, "flagged out-of-date on the AUR")
 
+    check_impersonation(rep, info["Name"], votes, age_days, info.get("URL"), repo_names)
+    check_mass_upload(rep, info["Maintainer"])
+
     # Typosquatting: e.g. "firefox-patch-bin" posing as a fix for the real "firefox".
     stem = re.sub(r"-(bin|git)$", "", info["Name"])
     for suf in SUSPICIOUS_SUFFIXES:
@@ -160,6 +166,99 @@ def check_aur_info(rep, info, repo_names):
                     f"name looks like a variant of official package "
                     f"'{stem[: -len(suf) - 1]}' (classic AUR malware naming)")
             break
+
+
+LOOKALIKES = {"l": ["1", "i"], "1": ["l", "i"], "i": ["l", "1"], "o": ["0"], "0": ["o"],
+              "rn": ["m"], "m": ["rn"], "vv": ["w"], "w": ["vv"]}
+NAME_SUFFIX = re.compile(r"-(bin|git|appimage|beta|nightly)$")
+KEYBOARD = ["1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm"]
+NEIGHBOURS = {}
+for _r, _row in enumerate(KEYBOARD):
+    for _c, _ch in enumerate(_row):
+        NEIGHBOURS[_ch] = {KEYBOARD[r][c] for r in (_r - 1, _r, _r + 1) if 0 <= r < len(KEYBOARD)
+                           for c in (_c - 1, _c, _c + 1) if 0 <= c < len(KEYBOARD[r])} - {_ch}
+
+
+def typo_variants(name):
+    """Names this one could be a typo of: doubled letters (yyay), an extra letter
+    in the middle (payru), swapped letters (yya), and look-alike characters."""
+    out = set()
+    for i in range(len(name) - 1):
+        if name[i] == name[i + 1] or 0 < i:
+            out.add(name[:i] + name[i + 1:])               # remove one character
+        out.add(name[:i] + name[i + 1] + name[i] + name[i + 2:])  # swap neighbours
+    for i, ch in enumerate(name):                          # neighbouring key hit
+        for n in NEIGHBOURS.get(ch, ()):
+            out.add(name[:i] + n + name[i + 1:])
+    for bad, goods in LOOKALIKES.items():
+        for i in range(len(name)):
+            if name.startswith(bad, i):
+                for good in goods:
+                    out.add(name[:i] + good + name[i + len(bad):])
+    out.discard(name)
+    return {v for v in out if len(v) >= 3 and not v.startswith("-") and not v.endswith("-")}
+
+
+def check_impersonation(rep, name, votes, age_days, url, repo_names):
+    """Flag names one typo away from a much more popular package (e.g. yyay -> yay)."""
+    if votes >= 50:
+        return  # an established package isn't an impersonator, even with a similar name
+    m = NAME_SUFFIX.search(name)
+    suffix = m.group(0) if m else ""
+    stem = name[: len(name) - len(suffix)]
+    candidates = set()
+    # A typo in the ending itself, e.g. "visual-studio-code-bim" for "...-bin".
+    if not suffix and "-" in name:
+        head, last = name.rsplit("-", 1)
+        for real in ("bin", "git"):
+            if last in typo_variants(real) | {real + real[-1]}:
+                candidates.add(f"{head}-{real}")
+    for v in typo_variants(stem):
+        candidates.update({v, v + suffix, v + "-bin", v + "-git"})
+    candidates -= {name, stem}
+    if not candidates:
+        return
+    try:
+        names = sorted(candidates)
+        infos = {}
+        for i in range(0, min(len(names), 400), 100):
+            infos.update(aur_info(names[i:i + 100]))
+    except OSError:
+        infos = {}
+    for c in sorted(candidates):
+        if c in repo_names:
+            popular, where, other_url = True, "repo package", None
+        elif c in infos:
+            other = infos[c]
+            popular = other["NumVotes"] >= 50 and other["NumVotes"] >= 10 * max(votes, 1)
+            where, other_url = f"popular AUR package ({other['NumVotes']} votes)", other.get("URL")
+        else:
+            continue
+        if not popular:
+            continue
+        same = " and points to the same upstream project" if url and url == other_url else ""
+        serious = votes < 10 and age_days < 90
+        rep.add(BLOCK if serious else WARN,
+                f"name is one typo away from {where} '{c}'{same}; impersonating popular "
+                "packages is how the Oct 2026 fake-yay malware spread"
+                + ("" if serious else " (may be a coincidence for an established package)"))
+        return
+
+
+def check_mass_upload(rep, maintainer):
+    """Malware accounts often upload many packages at once."""
+    if not maintainer:
+        return
+    try:
+        data = json.loads(http_get(f"{AUR}/rpc/v5/search/{urllib.parse.quote(maintainer)}"
+                                   "?by=maintainer"))
+    except (OSError, ValueError):
+        return
+    recent = [r for r in data.get("results", [])
+              if time.time() - r["FirstSubmitted"] < 7 * DAY]
+    if len(recent) >= 5:
+        rep.add(WARN, f"maintainer '{maintainer}' uploaded {len(recent)} new packages in the "
+                      "last 7 days (mass uploads are a common malware pattern)")
 
 
 # ---------------------------------------------------------------- sources
@@ -289,9 +388,55 @@ SCRIPT_RULES = [
     (WARN, r"\\x[0-9a-fA-F]{2}(\\x[0-9a-fA-F]{2}){15,}", "contains hex-escaped data (possible obfuscation)"),
 ]
 
+# Installing a *named* package from a language registry pulls code nobody reviewed.
+# Building from a lockfile ("npm install" / "npm ci" with no package name) is normal.
+REGISTRY_INSTALL = re.compile(
+    r"\b(?:npm|pnpm|yarn|bun)\s+(?:i|install|add)\b([^\n;&|]*)"
+    r"|\b(?:pip3?|pipx|uv\s+pip)\s+install\b([^\n;&|]*)"
+    r"|\b(?:cargo|gem)\s+install\b([^\n;&|]*)"
+    r"|\bgo\s+install\s+\S+@()")
+# Options whose next word is a value (a folder, file or setting), not a package.
+VALUE_FLAGS = {
+    "--cache", "--prefix", "--include", "--omit", "--registry", "--userconfig",
+    "--modules-folder", "--cwd", "--dir", "-C", "--filter", "--workspace", "-w", "--target",
+    "--arch", "--platform", "--runtime", "--tag", "--loglevel", "--network-timeout",
+    "--mutex", "--cache-folder", "--global-folder", "--dist-url", "--store-dir",
+    "--virtual-store-dir", "--path", "--root", "-r", "--requirement", "-c", "--constraint",
+    "-i", "--index-url", "--extra-index-url", "-f", "--find-links", "--install-dir", "-n",
+    "--bindir", "--git", "--branch", "--rev", "--features", "-F", "--profile", "-j",
+    "--jobs", "--config", "--target-dir"}
+PACKAGE_WORD = re.compile(r"^@?[a-zA-Z0-9][\w.\-]*(/[\w.\-]+)?([@=<>~^!].*)?$")
+
+
+def named_registry_install(text):
+    """Offset of the first command that installs a named registry package, or None."""
+    for m in REGISTRY_INSTALL.finditer(text):
+        args = next((g for g in m.groups() if g is not None), "")
+        if m.group(0).startswith("go"):
+            return m.start()
+        skip = False
+        for word in args.split():
+            if skip:
+                skip = False
+            elif word.startswith("-"):
+                skip = "=" not in word and word in VALUE_FLAGS
+            elif ("/" in word and not word.startswith("@")) or "$" in word \
+                    or word[0] in "\"'.~" or word.startswith(("http", "git+")):
+                continue  # a path, variable or URL, not a registry package
+            elif PACKAGE_WORD.match(word):
+                return m.start()
+    return None
+
+
 # Extra rules only for .INSTALL: these scripts run as ROOT during the install.
 INSTALL_RULES = [
     (BLOCK, r"\b(curl|wget|aria2c|fetch)\b", "downloads files while running as root"),
+    (BLOCK, r"\bgit\s+(clone|pull|fetch|archive)\b",
+     "downloads code with git while running as root"),
+    (BLOCK, named_registry_install, "installs software from a language package registry "
+     "while running as root"),
+    (BLOCK, r"\b(python[23]?|perl|ruby|node|php|lua)\b[^\n]*https?://",
+     "fetches from the internet with a scripting language while running as root"),
     (BLOCK, r"\b(useradd|usermod)\b[^\n]*-[a-zA-Z]*G[^\n]*\b(wheel|sudo|root)\b",
      "adds a user to an admin group"),
 ]
@@ -300,6 +445,18 @@ INSTALL_RULES = [
 PKGBUILD_RULES = [
     (WARN, r"^\s*[^#\n]*\b(curl|wget)\b(?![^\n]*(--version|-V\b))",
      "downloads files outside the source=() array (not checksum-verified)"),
+    (WARN, named_registry_install, "installs a named package from npm/PyPI/crates.io/RubyGems/Go "
+     "during the build (unreviewed code; this is how the June 2026 AUR attack worked)"),
+]
+
+
+# What an update adds to a PKGBUILD or install script.
+DIFF_RULES = [
+    (WARN, r"\b(curl|wget|aria2c)\b|\bgit\s+(clone|pull|fetch|archive)\b",
+     "a download command"),
+    (WARN, named_registry_install, "an install of a named npm/PyPI/crates.io/RubyGems/Go package"),
+    (WARN, r"\b(python[23]?|perl|ruby|node|php|lua)\b[^\n]*https?://",
+     "a scripting-language download"),
 ]
 
 
@@ -314,12 +471,17 @@ def strip_echo_lines(text):
     return "\n".join(l for l in text.splitlines() if not only_prints(l))
 
 
-def scan_script(rep, label, text, extra_rules=()):
+def scan_script(rep, label, text, extra_rules=(), base_rules=None):
     text = strip_echo_lines(text)
-    for level, pattern, desc in list(SCRIPT_RULES) + list(extra_rules):
-        m = re.search(pattern, text, re.MULTILINE)
-        if m:
-            line = text[: m.start()].count("\n") + 1
+    for level, pattern, desc in list(SCRIPT_RULES if base_rules is None else base_rules) \
+            + list(extra_rules):
+        if callable(pattern):
+            start = pattern(text)
+        else:
+            m = re.search(pattern, text, re.MULTILINE)
+            start = m.start() if m else None
+        if start is not None:
+            line = text[:start].count("\n") + 1
             snippet = text.splitlines()[line - 1].strip()[:100]
             rep.add(level, f"{label} {desc}  [line {line}: {snippet}]")
 
@@ -477,6 +639,8 @@ def audit_build_dir(path):
     if info is None:
         rep.add(WARN, "not found on the AUR (local/custom package, or deleted from the AUR, "
                       "which often happens when a package is removed for being malicious)")
+        check_impersonation(rep, base, 0, 0, (srcinfo_fields(srcinfo, "url") or [None])[0],
+                            repo_package_names())
     else:
         check_aur_info(rep, info, repo_package_names())
         if version != info["Version"] and not base.endswith(VCS_SUFFIXES):
@@ -487,6 +651,7 @@ def audit_build_dir(path):
     scan_script(rep, "PKGBUILD", pkgbuild, PKGBUILD_RULES)
     for name, text in installs.items():
         scan_script(rep, f"{name} (runs as root at install):", text, INSTALL_RULES)
+    check_update_diff(rep, path, names)
 
     if print_report(rep, load_allowlist()):
         say("\n==> aur-audit: hazardous AUR package found. Build cancelled before any "
@@ -497,6 +662,74 @@ def audit_build_dir(path):
     with open(marker, "w") as f:
         f.write(digest + "\n")
     return 0
+
+
+def git(path, *args):
+    """Read-only git in a yay build folder. External diff/textconv helpers are
+    disabled so a malicious repo can't make git run anything."""
+    return run(["git", "-C", path, "-c", "core.pager=cat", "--no-pager", *args])
+
+
+def srcinfo_version(text):
+    f = lambda k: (srcinfo_fields(text, k) or [""])[0]
+    v = f"{f('pkgver')}-{f('pkgrel')}"
+    return f"{f('epoch')}:{v}" if f("epoch") else v
+
+
+def check_update_diff(rep, path, names):
+    """For updates: what changed since the version you have installed? A new
+    committer adding downloads or package installs is the June 2026 takeover pattern."""
+    if not os.path.isdir(os.path.join(path, ".git")):
+        return
+    installed = next((v for v in (local_db_entry(n)[0] for n in names) if v), None)
+    if not installed:
+        return
+
+    history = git(path, "log", "--format=%H", "-n", "300", "--", ".SRCINFO").split()
+    baseline = next((h for h in history
+                     if srcinfo_version(git(path, "show", f"{h}:.SRCINFO")) == installed), None)
+    label = f"your installed version {installed}"
+    if baseline is None:
+        if len(history) < 2:
+            return
+        baseline, label = history[1], "the previous AUR version"
+    if git(path, "rev-parse", "HEAD").strip() == baseline:
+        return
+
+    diff = git(path, "diff", "--no-ext-diff", "--no-textconv", baseline, "HEAD", "--",
+               ".", ":(exclude).SRCINFO")
+    added = "\n".join(l[1:] for l in diff.splitlines()
+                      if l.startswith("+") and not l.startswith("+++"))
+    risky = []
+    probe = Report("diff")
+    scan_script(probe, "", added, DIFF_RULES)
+    for level, msg in probe.findings:
+        risky.append(msg.strip())
+
+    old_src = git(path, "show", f"{baseline}:.SRCINFO")
+    new_src = git(path, "show", "HEAD:.SRCINFO")
+    host = lambda u: (urllib.parse.urlparse(re.sub(r"^\w+\+", "", u.split("::", 1)[-1]))
+                      .hostname or "")
+    old_hosts = {host(u) for u in parse_srcinfo(old_src)[0]}
+    new_hosts = {host(u) for u in parse_srcinfo(new_src)[0]} - old_hosts - {""}
+    if new_hosts:
+        risky.append("downloads from new website(s): " + ", ".join(sorted(new_hosts)))
+    if set(srcinfo_fields(new_src, "install")) - set(srcinfo_fields(old_src, "install")):
+        risky.append("adds an install script (runs as root)")
+
+    authors = lambda rng: {a for a in git(path, "log", "--format=%an <%ae>", rng).splitlines() if a}
+    new_authors = authors(f"{baseline}..HEAD") - authors(baseline)
+
+    if new_authors:
+        rep.add(WARN if not risky else BLOCK,
+                f"changed hands since {label}: new committer(s) "
+                + ", ".join(sorted(new_authors))
+                + ("" if not risky else
+                   ". They added: " + "; ".join(risky[:4])
+                   + ". A new maintainer adding code like this is how the June 2026 "
+                     "AUR takeover attack worked"))
+    elif risky:
+        rep.add(WARN, f"since {label}, this update added: " + "; ".join(risky[:4]))
 
 
 def pacman_package_files():
@@ -571,6 +804,25 @@ by Arch packagers, and system packages legitimately match some rules (e.g. sudo
 installs /etc/sudoers), so judge each finding in context. Modified files listed
 as backup/config files are usually the user's own edits; modified binaries or
 libraries are a serious red flag.
+"""
+AI_INTRO_SYSTEM = """\
+You are reviewing a security snapshot of the user's Arch Linux system, gathered
+by "aur-audit" as a normal user (no root). It contains: every package installed
+from outside the official repos (AUR/local) with AUR reputation data, install
+scripts and PKGBUILDs; pacman's integrity check of ALL installed files; and the
+places malware uses to start itself (systemd units, autostart entries, cron, shell
+startup files, ld.so.preload), unowned setuid programs, executables in temporary
+folders, and processes running from them. Decide whether the system shows signs
+of compromise. Known benign patterns: regenerated caches (e.g. plugins.dat),
+/etc/resolv.conf replaced by a symlink, /boot permission differences, and distro
+tooling that deliberately edits a file (e.g. Omarchy pins some scripts' shebang to
+/bin/python3). Note anything the snapshot could not check.
+
+Start your answer with exactly one line:
+VERDICT: SIGNS OF COMPROMISE | SUSPICIOUS | NO SIGNS OF COMPROMISE
+Then list what deserves attention, most important first, each with the exact
+evidence and a safe, read-only command the user can run to look closer. Use plain
+language for someone who is not a security expert.
 """
 AI_INSTRUCTIONS = """\
 Everything after this message (scanner findings, PKGBUILD, .SRCINFO, install
@@ -869,9 +1121,20 @@ def ai_review(target, installed=False):
     if not tool:
         return 2
 
-    build, env = AI_TOOLS[tool]
     print(f"==> Asking {tool}{' (' + model + ')' if model else ''} to review {name}. "
           "This uses your AI assistant's normal usage/credits.\n")
+    out = os.path.expanduser(time.strftime(f"~/aur-audit-ai-review-{name}-%Y-%m-%d_%H-%M-%S.txt"))
+    if installed:
+        closing = ("The AI can be wrong. If it flags something, look into it before acting. "
+                   f"To remove the package: sudo pacman -Rns {name}")
+    else:
+        closing = f"The AI can be wrong. The package stays blocked unless YOU add it to {ALLOWLIST}."
+    return run_ai(tool, model, instructions, content, name, out, closing)
+
+
+def run_ai(tool, model, instructions, content, name, out, closing):
+    """Send content to the AI tool (tools disabled, empty folder), print and save the answer."""
+    build, env = AI_TOOLS[tool]
     with tempfile.TemporaryDirectory() as tmp:
         data = os.path.join(tmp, "package-files.txt")
         with open(data, "w") as f:
@@ -893,22 +1156,334 @@ def ai_review(target, installed=False):
         return 1
 
     print(answer)
-    out = os.path.expanduser(time.strftime(f"~/aur-audit-ai-review-{name}-%Y-%m-%d_%H-%M-%S.txt"))
     with open(out, "w") as f:
         f.write(f"AI review of {name} by {tool}{' (' + model + ')' if model else ''} "
                 f"on {time.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
-                "This is an AI opinion, not a guarantee. " + (
-                    "Look into anything it flags before acting on it.\n\n" if installed else
-                    f"aur-audit's block still stands unless you add the package to "
-                    f"{ALLOWLIST}.\n\n") + answer + "\n")
+                f"This is an AI opinion, not a guarantee. {closing}\n\n{answer}\n")
     print(f"\n==> AI review saved to {out}")
-    if installed:
-        print("==> The AI can be wrong. If it flags something, look into it before acting. "
-              f"To remove the package: sudo pacman -Rns {name}")
-    else:
-        print("==> The AI can be wrong. The package stays blocked unless YOU add it to "
-              f"{ALLOWLIST}.")
+    print(f"==> {closing}")
     return 0
+
+
+# ---------------------------------------------------------------- system scan
+
+TEMP_DIRS = ("/tmp", "/var/tmp", "/dev/shm")
+SHELL_STARTUP = ["~/.bashrc", "~/.bash_profile", "~/.bash_login", "~/.profile", "~/.zshrc",
+                 "~/.zprofile", "~/.zshenv", "~/.zlogin", "~/.config/fish/config.fish"]
+KNOWN_BAD = {"atomic-lockfile": "the npm package used in the June 2026 AUR attack"}
+# For shell startup files, mentioning .bashrc etc. is normal, so skip that rule.
+STARTUP_RULES = [r for r in SCRIPT_RULES if ".bashrc" not in r[1]]
+
+
+def unit_exec_lines(path):
+    try:
+        return [l.strip() for l in open(path, errors="replace")
+                if re.match(r"\s*Exec\w*=", l)]
+    except OSError:
+        return []
+
+
+def in_temp(path):
+    return path.startswith(TEMP_DIRS) or "/." in path.replace("/.local/", "/").replace(
+        "/.config/", "/").replace("/.cache/", "/")
+
+
+def system_scan():
+    """Gather a security snapshot without root. Returns (sections, ai_bundle)."""
+    sections, bundle = [], []
+    owned = set(l.rstrip("/") for l in run(["pacman", "-Qlq"]).splitlines())
+    home = os.path.expanduser("~")
+
+    # 1. Packages from outside the official repos ------------------------------
+    print("==> [1/4] Checking packages installed from the AUR or elsewhere...")
+    foreign = run(["pacman", "-Qmq"]).split()
+    repo_names = repo_package_names()
+    infos = {}
+    try:
+        for i in range(0, len(foreign), 100):
+            infos.update(aur_info(foreign[i:i + 100]))
+    except OSError as e:
+        print(f"    could not reach the AUR ({e}); reputation checks skipped")
+    pkg_reps = []
+    for n, name in enumerate(foreign, 1):
+        print(f"    ({n}/{len(foreign)}) {name}")
+        rep, details = Report(name), []
+        version, dbdir = local_db_entry(name)
+        rep.version = version
+        info = infos.get(name)
+        if info:
+            check_aur_info(rep, info, repo_names)
+            if version != info["Version"]:
+                rep.add(INFO, f"installed {version}, AUR has {info['Version']}")
+        else:
+            rep.add(WARN, "not on the AUR any more (or never was). Packages are deleted from "
+                          "the AUR when found to be malicious; find out why this one is gone")
+            check_impersonation(rep, name, 0, 0, None, repo_names)
+        try:
+            install = open(os.path.join(dbdir, "install"), errors="replace").read()
+            scan_script(rep, "install script (ran as root):", install, INSTALL_RULES)
+            details.append(f"--- install script ---\n{install[:4000]}")
+        except OSError:
+            pass
+        for path in run(["pacman", "-Qlq", name]).splitlines():
+            for level, pattern, d in PATH_RULES:
+                if re.search(pattern, path.lstrip("/")):
+                    rep.add(level, f"package {d}: {path}")
+            try:
+                st = os.lstat(path)
+                if stat.S_ISREG(st.st_mode) and st.st_mode & (stat.S_ISUID | stat.S_ISGID):
+                    rep.add(WARN, f"setuid/setgid file: {path}")
+            except OSError:
+                pass
+        cache = os.path.join(home, ".cache/yay", (info or {}).get("PackageBase", name))
+        try:
+            src = open(os.path.join(cache, ".SRCINFO"), errors="replace").read()
+            if srcinfo_version(src) == version:
+                pkgbuild = open(os.path.join(cache, "PKGBUILD"), errors="replace").read()
+                scan_script(rep, "PKGBUILD", pkgbuild, PKGBUILD_RULES)
+                details.append(f"--- PKGBUILD (version installed) ---\n{pkgbuild[:6000]}")
+        except OSError:
+            pass
+        pkg_reps.append((rep, details))
+    sections.append(("Packages from the AUR or elsewhere", [r for r, _ in pkg_reps]))
+    for rep, details in pkg_reps:
+        flagged = any(l in (BLOCK, WARN) for l, _ in rep.findings)
+        bundle.append(f"===== package {rep.name} {rep.version} =====\n{format_findings(rep)}"
+                      + ("\n" + "\n".join(details) if details and (flagged or len(foreign) <= 30)
+                         else ""))
+
+    # 2. Integrity of every installed file -------------------------------------
+    print("==> [2/4] Checking every installed file against pacman's records "
+          "(about a minute)...")
+    rep = Report("integrity")
+    check = subprocess.run(["pacman", "-Qkk"], capture_output=True, text=True)
+    lines = [l for l in check.stderr.splitlines() if l.startswith("warning:")]
+    unreadable = [l for l in lines if "Permission denied" in l or "failed to calculate" in l]
+    real = [l for l in lines if l not in unreadable]
+    changed = sorted({re.sub(r" \([^)]*\)$", "", l) for l in real
+                      if re.search(r"checksum mismatch|Size mismatch", l)})
+    other = [l for l in real if re.sub(r" \([^)]*\)$", "", l) not in changed]
+    for l in changed:
+        path = l.split(": ", 2)[-1]
+        program = re.match(r"/(usr/)?(s?bin|lib(32|64)?/[^/]+\.so)", path) or "/bin/" in path
+        rep.add(WARN if program else INFO, f"file contents changed since install: {l[9:]}")
+    rep.add(INFO, f"{len(other)} permission/owner/type differences, {len(unreadable)} files "
+                  "unreadable without root (skipped)")
+    sections.append(("Installed files changed since install", [rep]))
+    bundle.append("===== pacman -Qkk (all packages), contents changed =====\n"
+                  + ("\n".join(changed) or "(none)")
+                  + "\n===== other differences =====\n" + ("\n".join(other[:150]) or "(none)")
+                  + f"\n({len(unreadable)} files unreadable without root were skipped)")
+
+    # 3. Places malware uses to start itself -----------------------------------
+    print("==> [3/4] Checking startup locations (services, autostart, cron, shell)...")
+    rep = Report("persistence")
+    seen = []
+    if os.path.exists("/etc/ld.so.preload"):
+        try:
+            content = open("/etc/ld.so.preload").read().strip()
+        except OSError:
+            content = "(unreadable)"
+        rep.add(BLOCK, f"/etc/ld.so.preload exists (forces code into every program; "
+                       f"rootkit technique): {content[:200]}")
+        seen.append(f"/etc/ld.so.preload: {content}")
+    for base in ("/etc/systemd/system", "/usr/lib/systemd/system", "/usr/lib/systemd/user",
+                 "/etc/systemd/user", os.path.join(home, ".config/systemd/user")):
+        for root, _, files in os.walk(base):
+            for f in files:
+                path = os.path.join(root, f)
+                target = os.path.realpath(path)
+                if os.path.islink(path):
+                    if in_temp(target) or target.startswith("/home/") and "/.config/systemd" not in target:
+                        rep.add(BLOCK, f"enabled service points into an unusual place: "
+                                       f"{path} -> {target}")
+                    continue
+                if path in owned or not f.endswith((".service", ".timer", ".socket", ".path")):
+                    continue
+                execs = unit_exec_lines(path)
+                user_unit = path.startswith(home)
+                seen.append(f"{path}: " + " | ".join(execs))
+                bad = [e for e in execs if in_temp(e.split("=", 1)[-1].split()[0] if "=" in e else e)
+                       or re.search(r"curl|wget|base64|/dev/tcp|nc\s", e)]
+                if bad:
+                    rep.add(BLOCK, f"service runs something suspicious: {path}: {bad[0][:150]}")
+                elif not user_unit:
+                    rep.add(WARN, f"system service not installed by any package: {path}")
+                else:
+                    rep.add(INFO, f"your own user service: {path}")
+    autostart = [os.path.join(home, ".config/autostart")] + ["/etc/xdg/autostart"]
+    for d in autostart:
+        for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+            path = os.path.join(d, f)
+            if path in owned:
+                continue
+            entry = open(path, errors="replace").read()
+            if re.search(r"^Hidden\s*=\s*true", entry, re.MULTILINE | re.IGNORECASE):
+                continue  # this entry switches an autostart program OFF
+            execs = [l.strip() for l in entry.splitlines() if l.startswith("Exec")]
+            seen.append(f"{path}: " + " | ".join(execs))
+            cmd = " ".join(execs)
+            if in_temp(cmd.split("=", 1)[-1].split()[0] if "=" in cmd else "") or \
+                    re.search(r"curl|wget|base64|/dev/tcp", cmd):
+                rep.add(BLOCK, f"autostart entry runs something suspicious: {path}: {cmd[:150]}")
+            else:
+                rep.add(INFO, f"autostart entry: {path}: {cmd[:120]}")
+    cron = ["/etc/crontab"] + [os.path.join(d, f) for d in ("/etc/cron.d", "/etc/cron.hourly",
+            "/etc/cron.daily", "/etc/cron.weekly", "/etc/cron.monthly") if os.path.isdir(d)
+            for f in os.listdir(d)]
+    for path in cron:
+        if os.path.isfile(path) and path not in owned:
+            rep.add(WARN, f"cron job not installed by any package: {path}")
+            seen.append(f"cron: {path}")
+    user_cron = subprocess.run(["crontab", "-l"], capture_output=True, text=True) \
+        if shutil.which("crontab") else None
+    if user_cron and user_cron.returncode == 0 and user_cron.stdout.strip():
+        rep.add(WARN, "your user account has cron jobs (see report)")
+        seen.append("user crontab:\n" + user_cron.stdout[:2000])
+    startup = [os.path.expanduser(p) for p in SHELL_STARTUP] + \
+        [os.path.join("/etc/profile.d", f) for f in sorted(os.listdir("/etc/profile.d"))
+         if os.path.join("/etc/profile.d", f) not in owned]
+    for path in startup:
+        try:
+            text = open(path, errors="replace").read()
+        except OSError:
+            continue
+        probe = Report(path)
+        scan_script(probe, f"{path}:", text, base_rules=STARTUP_RULES)
+        for level, msg in probe.findings:
+            rep.add(level, msg)
+            seen.append(msg)  # only flagged lines are sent, never whole files (privacy)
+    sections.append(("Startup locations", [rep]))
+    bundle.append("===== startup locations not installed by packages =====\n"
+                  + ("\n".join(seen) or "(none)"))
+
+    # 4. Hidden programs, privilege escalation, known bad --------------------
+    print("==> [4/4] Looking for hidden programs and known malware traces...")
+    rep = Report("other")
+    found = []
+    suid = run(["find", "/usr", "/opt", "/etc", "-xdev", "-type", "f", "-perm", "/6000"])
+    for path in suid.splitlines():
+        if path not in owned:
+            rep.add(BLOCK, f"setuid/setgid program not installed by any package: {path}")
+            found.append(f"unowned setuid: {path}")
+    for d in TEMP_DIRS:
+        for path in run(["find", d, "-xdev", "-maxdepth", "3", "-type", "f", "-perm", "/111",
+                         "-not", "-path", "*/.mount_*"]).splitlines()[:50]:
+            try:
+                elf = open(path, "rb").read(4) == b"\x7fELF"
+            except OSError:
+                elf = False
+            rep.add(BLOCK if elf and d == "/dev/shm" else WARN,
+                    f"{'program' if elf else 'executable file'} in a temporary folder: {path}")
+            found.append(f"temp executable ({'ELF' if elf else 'script'}): {path}")
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            exe = os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            continue
+        if exe.startswith(TEMP_DIRS):
+            rep.add(BLOCK, f"running process {pid} started from a temporary folder: {exe}")
+            found.append(f"process {pid}: {exe}")
+    for d in ("/usr/bin", "/usr/lib/systemd/system-generators"):
+        for f in os.listdir(d) if os.path.isdir(d) else []:
+            path = os.path.join(d, f)
+            if path not in owned and not os.path.islink(path):
+                rep.add(WARN, f"program not installed by any package: {path}")
+                found.append(f"unowned: {path}")
+    local = sorted(f for f in (os.listdir("/usr/local/bin") if os.path.isdir("/usr/local/bin")
+                               else []) if f"/usr/local/bin/{f}" not in owned)
+    if local:
+        rep.add(INFO, "programs you installed by hand in /usr/local/bin: " + ", ".join(local[:30]))
+        found.append("/usr/local/bin: " + ", ".join(local))
+    for needle, what in KNOWN_BAD.items():
+        hits = run(["grep", "-rlsF", "--include=PKGBUILD", needle,
+                    os.path.join(home, ".cache/yay")]).split()
+        hits += run(["grep", "-rlsF", "-m1", needle, os.path.join(home, ".npm/_cacache/index-v5")]
+                    ).split()[:3]
+        for h in hits:
+            rep.add(BLOCK, f"trace of {what} ('{needle}'): {h}")
+            found.append(f"known-bad '{needle}': {h}")
+    rep.add(INFO, "not checked (needs root): eBPF programs (sudo bpftool prog list), "
+                  "root's cron jobs, /etc/sudoers.d, files only root can read")
+    sections.append(("Hidden programs and known malware traces", [rep]))
+    bundle.append("===== other checks =====\n" + ("\n".join(found) or "(nothing found)")
+                  + "\nNot checked (needs root): eBPF programs, root crontab, /etc/sudoers.d")
+    return sections, "\n\n".join(bundle)
+
+
+def print_system_report(sections):
+    """Print the free scan's results; returns the text and the number of serious findings."""
+    out, serious = [], 0
+    order = {BLOCK: 0, WARN: 1, INFO: 2}
+    names = {BLOCK: "SERIOUS", WARN: "CHECK", INFO: "INFO"}
+    for title, reps in sections:
+        out.append(f"\n==> {title}")
+        for rep in reps:
+            shown = [f for f in rep.findings if f[0] != INFO or len(reps) == 1]
+            if len(reps) > 1:
+                worst = min((order[l] for l, _ in rep.findings), default=2)
+                if worst == 2:
+                    out.append(f"  {rep.name} {rep.version or ''}: ok")
+                    continue
+                out.append(f"  {rep.name} {rep.version or ''}:")
+            for level, msg in sorted(shown, key=lambda f: order[f[0]]):
+                serious += level == BLOCK
+                out.append(f"  {'  ' if len(reps) > 1 else ''}[{names[level]}] {msg}")
+    text = "\n".join(out)
+    print(text)
+    return text, serious
+
+
+def system_command(with_ai=False, assume_yes=False):
+    if os.geteuid() == 0:
+        print("aur-audit: run this as yourself, not with sudo.")
+        return 2
+    sections, bundle = system_scan()
+    text, serious = print_system_report(sections)
+    stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    report = os.path.expanduser(f"~/aur-audit-system-scan-{stamp}.txt")
+    with open(report, "w") as f:
+        f.write(f"aur-audit system scan on {time.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+                "SERIOUS = investigate now, CHECK = worth a look, INFO = background.\n"
+                + text + "\n")
+    print(f"\n==> {serious} serious finding(s). Report saved to {report}")
+    if not with_ai:
+        print("==> For a second opinion from your AI assistant: aur-audit ai --system")
+        return 1 if serious else 0
+    return ai_system_review(bundle, stamp, assume_yes)
+
+
+def ai_system_review(bundle, stamp, assume_yes):
+    tool, model = choose_ai()
+    if not tool:
+        return 2
+    instructions = AI_INTRO_SYSTEM + "\n" + AI_INSTRUCTIONS.split("Check:")[0]
+    data = os.path.expanduser(f"~/aur-audit-ai-system-data-{stamp}.txt")
+    with open(data, "w") as f:
+        f.write(bundle)
+    # Roughly 3.5 characters per token for this mix of code and text.
+    tokens_in = int((len(instructions) + len(bundle)) / 3.5 / 100 + 1) * 100
+    tokens_out = 4000
+    local = tool == "ollama"
+    print(f"""
+==> AI system review with {tool}{' (' + model + ')' if model else ''}
+    Data to send:      {len(bundle) / 1024:.0f} KB (exactly what will be sent: {data})
+    Estimated usage:   about {tokens_in:,} input tokens + up to {tokens_out:,} output tokens
+                       = roughly {tokens_in + tokens_out:,} tokens
+    {tool} also adds its own built-in instructions, so real usage will be somewhat higher.
+    {"This stays on your computer (Ollama), so it costs nothing but time." if local else
+     "This uses your " + tool + " plan's usage or API credits, and sends package names,"
+     " file paths, service/startup entries and flagged lines to " + tool + "'s servers."}""")
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            print("Not running interactively; add --yes to confirm.")
+            return 2
+        if input("\nSend it? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("Cancelled. Nothing was sent.")
+            return 0
+    return run_ai(tool, model, instructions, bundle, "system",
+                  os.path.expanduser(f"~/aur-audit-ai-system-review-{stamp}.txt"),
+                  "The AI can be wrong. Check its evidence before acting on it.")
 
 
 STAGES = {
@@ -920,6 +1495,10 @@ STAGES = {
 
 def main(argv):
     sys.stdout.reconfigure(line_buffering=True)  # show progress live, even through pacman/yay
+    if len(argv) == 2 and argv[1] == "system":
+        return system_command()
+    if len(argv) in (3, 4) and argv[1] == "ai" and argv[2] == "--system":
+        return system_command(with_ai=True, assume_yes=argv[3:] == ["--yes"])
     if len(argv) == 4 and argv[1] == "ai" and argv[2] == "--installed":
         return ai_review(argv[3], installed=True)
     if len(argv) == 3 and argv[1] == "ai":
