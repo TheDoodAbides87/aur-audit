@@ -1142,14 +1142,22 @@ def run_ai(tool, model, instructions, content, name, out, closing):
         stdin = content if tool != "ollama" else instructions + "\n\n" + content
         if tool == "opencode":
             stdin = ""
+        print(f"\n==> Waiting for {tool}'s answer (usually under a minute; "
+              "press Ctrl+C to cancel)...\n")
         try:
             proc = subprocess.run(build(data, model, instructions), input=stdin, text=True,
                                   cwd=tmp, capture_output=True, env={**os.environ, **env},
                                   timeout=AI_TIMEOUT)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
             print(f"aur-audit ai: {tool} gave no answer within {AI_TIMEOUT // 60} minutes; "
                   "try again later.")
+            err = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else e.stderr
+            if err and err.strip():
+                print(f"Last messages from {tool}:\n{err.strip()[-2000:]}")
             return 1
+        except KeyboardInterrupt:
+            print(f"\naur-audit ai: cancelled. {tool} may still count what it had already used.")
+            return 130
     answer = proc.stdout.strip()
     if proc.returncode != 0 or not answer:
         print(f"aur-audit ai: {tool} failed:\n{proc.stderr.strip()[-2000:]}")
