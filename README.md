@@ -333,5 +333,7 @@ with no warranty; see the license for details.
 [aur-audit-omarchy](https://github.com/TheDoodAbides87/aur-audit-omarchy) adds
 a shield icon and panel to the [Omarchy](https://omarchy.org/) bar. From the
 panel you can see your last scan result, run scans, check packages, and read
-reports. It's made for Omarchy only and won't work on other desktops. A
-standalone graphical tool for other Arch Linux setups may come later.
+reports. It's only a front-end: it needs aur-audit installed (see
+[Install](#install)) and does no scanning of its own. It's made for Omarchy
+only and won't work on other desktops. A standalone graphical tool for other
+Arch Linux setups may come later.
