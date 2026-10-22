@@ -327,3 +327,11 @@ rm -f ~/aur-audit-*.txt          # optional: saved reports
 
 [MIT](LICENSE): anyone can use, copy, modify, and share this freely. It comes
 with no warranty; see the license for details.
+
+## Desktop front-end (Omarchy)
+
+[aur-audit-omarchy](https://github.com/TheDoodAbides87/aur-audit-omarchy) adds
+a shield icon and panel to the [Omarchy](https://omarchy.org/) bar. From the
+panel you can see your last scan result, run scans, check packages, and read
+reports. It's made for Omarchy only and won't work on other desktops. A
+standalone graphical tool for other Arch Linux setups may come later.
